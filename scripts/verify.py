@@ -4,6 +4,8 @@
 对运行中的裁决服务执行一组固定验收用例，全部通过则进程以 0 退出，
 否则输出失败明细并以 1 退出。用例覆盖：
 
+* 健康地址 /healthz、/health、/ 均返回 200 且 status=ok（Docker 健康检查
+  所用地址不得 404），且容器健康检查脚本对健康服务退出码为 0；
 * 三类特殊规则的临界距离（恰好等于要求 -> 合规），且刻意使用排差/列差/
   层差组合，证明使用的是三轴曼哈顿距离而非欧氏距离、不忽略中间空位；
 * 临界再低一格 -> 唯一冲突，返回证据由本脚本独立按曼哈顿距离复算；
@@ -18,13 +20,16 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 BASE_URL = os.environ.get("VERIFY_BASE_URL", "http://api:8000").rstrip("/")
 ENDPOINT = f"{BASE_URL}/api/v1/adjudicate"
+HEALTHCHECK_SCRIPT = Path(__file__).resolve().parent / "healthcheck.py"
 TIMEOUT = 10.0
 
 failures: list[str] = []
@@ -130,10 +135,21 @@ def expect_422(client: httpx.Client, name: str, body: Any) -> None:
 def main() -> int:
     print(f"验收目标: {ENDPOINT}")
     with httpx.Client() as client:
-        # 0. 存活探针
-        health = client.get(f"{BASE_URL}/healthz", timeout=TIMEOUT)
-        check("GET /healthz -> 200 ok", health.status_code == 200 and health.json().get("status") == "ok",
-              f"{health.status_code} {health.text}")
+        # 0. 健康地址（Docker 健康检查与直接访问均不得 404）
+        for path in ("/healthz", "/health", "/"):
+            response = client.get(f"{BASE_URL}{path}", timeout=TIMEOUT)
+            ok = response.status_code == 200 and response.json().get("status") == "ok"
+            check(f"GET {path} -> 200 且 status=ok", ok,
+                  f"{response.status_code} {response.text}")
+
+        # 以容器健康检查所用脚本对运行中的服务探测，退出码必须为 0。
+        script_env = {**os.environ, "HEALTHCHECK_URL": f"{BASE_URL}/healthz"}
+        result = subprocess.run(
+            [sys.executable, str(HEALTHCHECK_SCRIPT)],
+            env=script_env, capture_output=True, timeout=TIMEOUT,
+        )
+        check("scripts/healthcheck.py 对健康服务退出码为 0",
+              result.returncode == 0, result.stderr.decode())
 
         print("\n[1] 临界距离必须判为合规（实际 == 要求）")
         # A-B 要求 3

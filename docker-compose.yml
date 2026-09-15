@@ -6,7 +6,7 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status == 200 else 1)"]
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -14,8 +14,12 @@ services:
     restart: unless-stopped
 
   # 一次性验收服务：启动 -> 对 api 执行全部验收用例 -> 退出（退出码即结论）。
+  # 放在独立 profile 中：默认 `docker compose up` 只启动常驻 api，
+  # verify 正常退出（exit 0）不会导致默认启动命令报错。
+  # 显式运行：docker compose --profile verify run --rm verify
   verify:
     image: dangerous-goods-adjudicator:1.0.0
+    profiles: ["verify"]
     depends_on:
       api:
         condition: service_healthy

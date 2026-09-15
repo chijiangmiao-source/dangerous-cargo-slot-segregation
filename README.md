@@ -18,6 +18,7 @@ Python 3.13 + FastAPI + Pydantic v2，规则与接口全量 pytest 覆盖，
 │   ├── test_rules.py
 │   └── test_api.py
 ├── scripts/
+│   ├── healthcheck.py       # 容器 HEALTHCHECK 探针脚本（200+status=ok -> 0）
 │   └── verify.py            # 一次性验收脚本（verify 服务入口）
 ├── Dockerfile               # python:3.13-slim
 ├── docker-compose.yml       # api（常驻）+ verify（一次性）
@@ -31,18 +32,25 @@ Python 3.13 + FastAPI + Pydantic v2，规则与接口全量 pytest 覆盖，
 ### Docker Compose（推荐，使用 Python 3.13 镜像）
 
 ```bash
-# 启动常驻 API（宿主端口默认 8000，可用 API_PORT 覆盖）
-docker compose up -d --build api
+# 默认启动整套服务：只启动常驻 API（verify 在独立 profile 中，不会运行）。
+# 宿主端口默认 8000，可用 API_PORT 覆盖。
+docker compose up -d --build
 
-# 一次性验收：构建（若尚未构建）→ 等 API 健康 → 跑全部验收用例 → 退出
-docker compose up --build verify; echo "exit=$?"
-# exit=0 表示全部通过；若 api 是刚构建的，也可先 docker compose build
+# 一次性验收：构建（若尚未构建）-> 后台拉起 api 并等其健康 ->
+# 前台跑全部验收用例 -> verify 容器退出（退出码即结论）并自动删除。
+docker compose --profile verify run --build --rm verify; echo "exit=$?"
+# exit=0 表示全部通过。
 ```
+
+为什么验收服务不放在默认启动集合：`verify` 是**一次性**容器（跑完即退出）。
+若与常驻 API 一同 `docker compose up`，它正常退出（exit 0）会导致前台
+`up` 命令报错并收掉整套服务。因此 `verify` 归入独立的 `verify` profile，
+默认启动只有持续可用的 API；显式加 `--profile verify` 才运行验收。
 
 `API_PORT` 只覆盖**宿主侧**映射端口，容器内始终监听 8000：
 
 ```bash
-API_PORT=9090 docker compose up -d api
+API_PORT=9090 docker compose up -d
 # 访问 http://localhost:9090
 ```
 
@@ -65,9 +73,19 @@ VERIFY_BASE_URL=http://127.0.0.1:8000 python scripts/verify.py
 
 ## 接口说明（规则与边界例子就在这里）
 
-### `GET /healthz`
+### 健康检查地址
 
-存活探针，返回 `200 {"status": "ok"}`。
+以下三个地址均返回服务健康信息（直接访问不会 404）：
+
+| 地址 | 返回 |
+|---|---|
+| `GET /healthz` | `200 {"status": "ok"}` — Docker HEALTHCHECK 探针固定地址 |
+| `GET /health` | `200 {"status": "ok", "service": ..., "version": ...}` |
+| `GET /` | `200` 健康信息 + 可用端点与 `/docs` 入口 |
+
+容器健康检查由 `scripts/healthcheck.py` 执行：请求 `/healthz`，HTTP 200 且
+JSON 中 `status == "ok"` 才以退出码 0 报告健康；连接失败、超时、非 200 或
+状态异常一律退出码 1（不依赖第三方库，slim 镜像可直接运行）。
 
 ### `POST /api/v1/adjudicate`
 
@@ -202,10 +220,11 @@ curl -s http://localhost:8000/api/v1/adjudicate \
    （`restart: "no"`，不会常驻或假成功）。
 
 ```bash
-docker compose up --build verify
+docker compose --profile verify run --build --rm verify
 ```
 
 本地直跑：`VERIFY_BASE_URL=http://127.0.0.1:8000 python scripts/verify.py`。
+首项检查即三个健康地址与 `scripts/healthcheck.py` 探针退出码。
 
 ## 测试
 
@@ -213,10 +232,11 @@ docker compose up --build verify
 pytest -q
 ```
 
-覆盖（67 项）：规则矩阵完整性与对称性、曼哈顿三轴定义、非欧氏判定、
+覆盖（73 项）：规则矩阵完整性与对称性、曼哈顿三轴定义、非欧氏判定、
 空位不折叠、临界相等合规、低一格冲突、首冲突双层排序、类别不参与排序、
-20 次乱序可复现性、比较对数计数，以及全部 422 边界（尺寸非正、上下界越界、
-重复、未知类别、缺字段、多字段、类型错误、空体）。
+20 次乱序可复现性、比较对数计数、三个健康地址与探针脚本退出码，以及全部
+422 边界（尺寸非正、上下界越界、重复、未知类别、缺字段、多字段、类型错误、
+空体）。
 
 ## 设计说明
 
