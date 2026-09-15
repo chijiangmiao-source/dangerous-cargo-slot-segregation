@@ -11,7 +11,9 @@
 * 临界再低一格 -> 唯一冲突，返回证据由本脚本独立按曼哈顿距离复算；
 * 多冲突时首项按 (较小箱位, 较大箱位) 排序，且与输入顺序无关；
 * 全部非法输入（尺寸非正、越界、重复、未知类别、缺字段、多字段）整份 422；
-* 无冲突时返回比较对数 C(n, 2)。
+* 无冲突时返回比较对数 C(n, 2)；
+* 推荐箱位接口：最近可行壳层并列时按 (排,列,层) 字典序取首项且与输入
+  顺序无关、小舱无解返回 no_safe_slot 且不含坐标、非法请求整份 422。
 
 环境变量：
     VERIFY_BASE_URL  被测服务地址，默认 http://api:8000（Compose 网络）。
@@ -19,6 +21,7 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 import subprocess
 import sys
@@ -29,6 +32,7 @@ import httpx
 
 BASE_URL = os.environ.get("VERIFY_BASE_URL", "http://api:8000").rstrip("/")
 ENDPOINT = f"{BASE_URL}/api/v1/adjudicate"
+SLOT_ENDPOINT = f"{BASE_URL}/api/v1/recommend-slot"
 HEALTHCHECK_SCRIPT = Path(__file__).resolve().parent / "healthcheck.py"
 TIMEOUT = 10.0
 
@@ -130,6 +134,185 @@ def expect_422(client: httpx.Client, name: str, body: Any) -> None:
               "status" not in data and "first_conflict" not in data
               and "pairs_compared" not in data and "detail" in data,
               str(data))
+
+
+# ---------------------------------------------------------------------------
+# /api/v1/recommend-slot
+# ---------------------------------------------------------------------------
+
+def slot_body(containers: list[dict[str, Any]], category: str,
+              expected: tuple[int, int, int], **sizes: Any) -> dict[str, Any]:
+    return {
+        "max_row": sizes.get("max_row", 20),
+        "max_col": sizes.get("max_col", 20),
+        "max_tier": sizes.get("max_tier", 10),
+        "containers": containers,
+        "category": category,
+        "expected": {"row": expected[0], "col": expected[1], "tier": expected[2]},
+    }
+
+
+def post_slot(client: httpx.Client, body: dict[str, Any]) -> httpx.Response:
+    return client.post(SLOT_ENDPOINT, json=body, timeout=TIMEOUT)
+
+
+def slot_requirement(a: str, b: str) -> int:
+    pair = frozenset((a, b))
+    if pair == frozenset(("A", "B")):
+        return 3
+    if pair == frozenset(("A", "C")) or pair == frozenset(("B", "D")):
+        return 2
+    return 1
+
+
+def verify_slot_checks(client: httpx.Client) -> None:
+    print("\n[6] 推荐箱位：最近层并列取字典序首位（乱序不变）")
+
+    # 期望点 (3,3,3) 被 A 占据，待装 B 要求距 A 为 3；半径 1、2 壳层全部
+    # 不足，半径 3 壳层并列安全点的字典序首位为 (1,2,3)。
+    center = (3, 3, 3)
+    nearest_case = [box(3, 3, 3, "A")]
+    response = post_slot(
+        client, slot_body(nearest_case, "B", center,
+                          max_row=5, max_col=5, max_tier=5))
+    check("并列取首位 [HTTP 200]", response.status_code == 200,
+          f"got {response.status_code} {response.text}")
+    data = response.json() if response.status_code == 200 else {}
+    coord = data.get("coordinate")
+    check("并列取首位 [status=recommended 且字段完整]",
+          data.get("status") == "recommended" and isinstance(coord, dict)
+          and set(coord) == {"row", "col", "tier"}
+          and set(data) == {"status", "coordinate", "search_distance"},
+          str(data))
+    expected_coord = {"row": 1, "col": 2, "tier": 3}
+    check("并列取首位 [中选 (1,2,3)，搜索距离 3]",
+          coord == expected_coord and data.get("search_distance") == 3, str(data))
+    if coord:
+        # 独立复算：搜索距离即到期望点的曼哈顿距离，且对全部现存箱满足隔离。
+        dist_to_expected = manhattan(coord, {"row": center[0], "col": center[1],
+                                             "tier": center[2]})
+        check("并列取首位 [search_distance 可独立复算]",
+              dist_to_expected == data["search_distance"] == 3, str(data))
+        for existing in nearest_case:
+            d = manhattan(coord, existing)
+            check(f"并列取首位 [对现存 {existing['category']} 箱距离 {d} >= "
+                  f"{slot_requirement('B', existing['category'])}]",
+                  d >= slot_requirement("B", existing["category"]), str(data))
+
+    # 验收侧暴力枚举复核：中选点确为（半径升序、同层字典序）首个安全点。
+    occupied = {(c["row"], c["col"], c["tier"]) for c in nearest_case}
+    safe_points: list[tuple[int, tuple[int, int, int]]] = []
+    for p in itertools.product(range(1, 6), repeat=3):
+        if p in occupied:
+            continue
+        if all(
+            abs(p[0] - c["row"]) + abs(p[1] - c["col"]) + abs(p[2] - c["tier"])
+            >= slot_requirement("B", c["category"])
+            for c in nearest_case
+        ):
+            radius = abs(p[0] - 3) + abs(p[1] - 3) + abs(p[2] - 3)
+            safe_points.append((radius, p))
+    brute_first = sorted(safe_points)[0]
+    check("并列取首位 [暴力枚举复核首个安全点]",
+          (data.get("search_distance"), (coord or {}).get("row"),
+           (coord or {}).get("col"), (coord or {}).get("tier"))
+          == (brute_first[0], *brute_first[1]),
+          f"{str(data)} vs {brute_first}")
+
+    # 加入更多现存箱后，全部 24 种输入排列必须返回完全相同的结果。
+    shuffled_case = [
+        box(3, 3, 3, "A"), box(5, 5, 5, "D"),
+        box(1, 1, 1, "C"), box(2, 4, 3, "A"),
+    ]
+    reference = None
+    all_same = True
+    for permutation in itertools.permutations(shuffled_case):
+        shuffled_response = post_slot(
+            client, slot_body(list(permutation), "B", center))
+        if shuffled_response.status_code != 200:
+            all_same = False
+            break
+        payload_data = shuffled_response.json()
+        if reference is None:
+            reference = payload_data
+        elif payload_data != reference:
+            all_same = False
+            break
+    check("乱序输入（24 种排列）返回完全相同的推荐", all_same and reference is not None,
+          f"reference={reference}")
+
+    print("\n[7] 推荐箱位：小舱无安全位置 -> no_safe_slot 且不含坐标")
+    # 1x1x1：唯一位置被占。
+    response = post_slot(client, slot_body([box(1, 1, 1, "A")], "B", (1, 1, 1),
+                                           max_row=1, max_col=1, max_tier=1))
+    check("满舱无解 [HTTP 200]", response.status_code == 200,
+          f"got {response.status_code} {response.text}")
+    if response.status_code == 200:
+        data = response.json()
+        check("满舱无解 [仅返回 status=no_safe_slot]",
+              data == {"status": "no_safe_slot"}, str(data))
+
+    # 1x1x2：A 占一格，另一格距 A 为 1 < 3，B 全舱无解；两种排列一致。
+    blocked = [box(1, 1, 1, "A"), box(1, 1, 2, "C")]
+    bodies = [
+        slot_body(blocked, "B", (1, 1, 1), max_row=1, max_col=1, max_tier=2),
+        slot_body(list(reversed(blocked)), "B", (1, 1, 2),
+                  max_row=1, max_col=1, max_tier=2),
+    ]
+    responses = [post_slot(client, body) for body in bodies]
+    ok = all(r.status_code == 200 and r.json() == {"status": "no_safe_slot"}
+             for r in responses)
+    check("隔离受限小舱无解，且与输入顺序/期望点无关", ok,
+          " / ".join(r.text for r in responses))
+
+    print("\n[8] 推荐箱位：非法请求整份 422，不产生部分结果")
+    good = slot_body([], "A", (1, 1, 1))
+    invalid_bodies: list[tuple[str, Any]] = [
+        ("期望排超出上界", {**good, "expected": {"row": 21, "col": 1, "tier": 1}}),
+        ("期望列取下界 0", {**good, "expected": {"row": 1, "col": 0, "tier": 1}}),
+        ("期望层为负数", {**good, "expected": {"row": 1, "col": 1, "tier": -2}}),
+        ("待装未知类别 E", {**good, "category": "E"}),
+        ("待装小写类别 a", {**good, "category": "a"}),
+        ("现存箱重复占位", slot_body([box(1, 1, 1, "A"), box(1, 1, 1, "B")],
+                                     "A", (1, 1, 1))),
+        ("现存箱越界", slot_body([box(21, 1, 1, "A")], "A", (1, 1, 1))),
+        ("现存箱未知类别", slot_body([box(1, 1, 1, "Z")], "A", (1, 1, 1))),
+        ("尺寸为字符串", {**good, "max_row": "20"}),
+        ("待装类别为数字", {**good, "category": 1}),
+        ("期望坐标为字符串", {**good, "expected": {"row": "1", "col": 1, "tier": 1}}),
+        ("期望坐标含未声明字段",
+         {**good, "expected": {"row": 1, "col": 1, "tier": 1, "x": 1}}),
+        ("缺少 category 字段",
+         {k: v for k, v in good.items() if k != "category"}),
+        ("缺少 expected 字段",
+         {k: v for k, v in good.items() if k != "expected"}),
+        ("现存箱含未声明字段",
+         slot_body([{**box(1, 1, 1, "A"), "weight": 9}], "A", (1, 1, 1))),
+        ("顶层含未声明字段", {**good, "ship": "x"}),
+        ("空 JSON", {}),
+    ]
+    for name, invalid_body in invalid_bodies:
+        response = post_slot(client, invalid_body)
+        ok_status = response.status_code == 422
+        check(f"{name} [HTTP 422]", ok_status,
+              f"got {response.status_code} {response.text}")
+        if ok_status:
+            data = response.json()
+            check(f"{name} [无任何推荐字段]",
+                  "status" not in data and "coordinate" not in data
+                  and "search_distance" not in data and "detail" in data,
+                  str(data))
+
+    # 多问题同时存在（期望越界 + 现存重复 + 未知类别）仍只回一次 422。
+    response = post_slot(client, {
+        "max_row": 3, "max_col": 3, "max_tier": 3,
+        "containers": [box(1, 1, 1, "A"), box(1, 1, 1, "B"), box(9, 9, 9, "E")],
+        "category": "B",
+        "expected": {"row": 9, "col": 1, "tier": 1},
+    })
+    check("多问题并存仍整份 422",
+          response.status_code == 422 and "status" not in response.json(),
+          f"got {response.status_code} {response.text}")
 
 
 def main() -> int:
@@ -246,13 +429,16 @@ def main() -> int:
         expect_422(client, "顶层含未声明字段", {**good, "ship": "x"})
         expect_422(client, "空 JSON", {})
 
+        verify_slot_checks(client)
+
     print(f"\n共执行 {checks_run} 项检查。")
     if failures:
         print(f"验收失败：{len(failures)} 项未通过。")
         for item in failures:
             print(f"  - {item}")
         return 1
-    print("验收通过：全部临界距离合规，低一格冲突唯一且可复算，非法输入整份 422。")
+    print("验收通过：裁决临界合规/首冲突/比较对数与推荐箱位三组场景全部符合预期，"
+          "非法输入整份 422。")
     return 0
 
 

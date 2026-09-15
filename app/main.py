@@ -6,8 +6,10 @@ from .models import (
     AdjudicationRequest,
     AdjudicationResponse,
     ConflictEvidence,
+    SlotRequest,
+    SlotResponse,
 )
-from .rules import adjudicate
+from .rules import adjudicate, recommend_slot
 
 SERVICE_NAME = "dangerous-goods-adjudicator"
 SERVICE_VERSION = "1.0.0"
@@ -41,7 +43,12 @@ def root() -> dict[str, object]:
     return {
         **info,
         "docs": "/docs",
-        "endpoints": ["/healthz", "/health", "/api/v1/adjudicate"],
+        "endpoints": [
+            "/healthz",
+            "/health",
+            "/api/v1/adjudicate",
+            "/api/v1/recommend-slot",
+        ],
     }
 
 
@@ -68,4 +75,34 @@ def adjudicate_endpoint(
             actual_distance=conflict.actual_distance,
             required_distance=conflict.required_distance,
         ),
+    }
+
+
+@app.post(
+    "/api/v1/recommend-slot",
+    response_model=SlotResponse,
+    tags=["adjudication"],
+    summary="为待装箱寻找离期望坐标最近的安全箱位",
+)
+def recommend_slot_endpoint(request: SlotRequest) -> dict[str, object]:
+    result = recommend_slot(
+        request.max_row,
+        request.max_col,
+        request.max_tier,
+        request.containers,
+        request.category,
+        (request.expected.row, request.expected.col, request.expected.tier),
+    )
+
+    if result is None:
+        return {"status": "no_safe_slot"}
+
+    return {
+        "status": "recommended",
+        "coordinate": {
+            "row": result.coordinate[0],
+            "col": result.coordinate[1],
+            "tier": result.coordinate[2],
+        },
+        "search_distance": result.search_distance,
     }
